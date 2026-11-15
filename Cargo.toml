@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = ["rynarmic"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+# MIT for the parts written for this crate, 0BSD for the parts rewritten from
+# Dynarmic. Both are permissive and compatible with a GPL-2.0(-or-later) host.
+# See README.md and LICENSE-DYNARMIC.txt for the attribution and full notice.
+license = "MIT AND 0BSD"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

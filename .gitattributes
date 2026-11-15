@@ -1,0 +1,2 @@
+# Use LF everywhere, so that CRLF on Windows does not show up as diff noise
+* text=auto eol=lf

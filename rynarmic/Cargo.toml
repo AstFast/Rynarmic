@@ -1,0 +1,18 @@
+[package]
+name = "rynarmic"
+description = "ARM A32/Thumb (ARMv5TEJ) recompiler; AI rewrite of Dynarmic code, human-tested only"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "rynarmic"
+path = "src/lib.rs"
+
+[dependencies]
+dynasmrt = "5.1.0"
+
+[features]
+default = []
+# Reserved for further JIT backends and tracing
