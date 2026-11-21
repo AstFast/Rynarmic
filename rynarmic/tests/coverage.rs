@@ -33,11 +33,19 @@ fn thumb_encoding_space_is_fully_covered() {
     let mut undefined = 0usize;
     let mut unsupported = 0usize;
     let mut undefined_high_bytes = std::collections::BTreeSet::new();
+    // Which stretches are unimplemented, by top byte. This is the input to any decision about
+    // extending the decoder: the ARMv6T2 16-bit additions (`0xB1xx` CBZ/CBNZ, `0xB2xx`
+    // SXTH/UXTH/SXTB/UXTB, `0xBAxx` REV/REV16/REVSH) live in three known places, and anything
+    // outside those three is either reserved or a format this decoder simply never grew.
+    let mut unsupported_high_bytes: std::collections::BTreeMap<u8, usize> =
+        std::collections::BTreeMap::new();
+    let mut bl_prefixes = 0usize;
 
     for raw in 0..=u16::MAX {
         // BL and BLX prefixes are tallied separately (they need a pair; one halfword is not an instruction)
         if rynarmic::decoder::thumb::is_bl_prefix(raw) {
             unsupported += 1;
+            bl_prefixes += 1;
             continue;
         }
         match rynarmic::decoder::thumb::decode(raw, CODE, true) {
@@ -53,7 +61,10 @@ fn thumb_encoding_space_is_fully_covered() {
                 undefined += 1;
                 undefined_high_bytes.insert((raw >> 8) as u8);
             }
-            Err(rynarmic::DecodeError::Unsupported { .. }) => unsupported += 1,
+            Err(rynarmic::DecodeError::Unsupported { .. }) => {
+                unsupported += 1;
+                *unsupported_high_bytes.entry((raw >> 8) as u8).or_default() += 1;
+            }
         }
     }
 
@@ -78,6 +89,17 @@ fn thumb_encoding_space_is_fully_covered() {
     println!(
         "Thumb halfwords: decoded {decoded} / undefined {undefined} / unimplemented {unsupported} (of 65536)"
     );
+    println!(
+        "  of the {unsupported} unimplemented: {bl_prefixes} are the BL/BLX prefix range (0xF0xx-0xF7xx)"
+    );
+    let rows: Vec<String> = unsupported_high_bytes
+        .iter()
+        .map(|(hi, n)| format!("{hi:02X}xx:{n}"))
+        .collect();
+    println!("  by top byte (count of unimplemented encodings):");
+    for chunk in rows.chunks(8) {
+        println!("    {}", chunk.join("  "));
+    }
 }
 
 #[test]

@@ -1,10 +1,10 @@
 //! The Thumb decoder: ARMv5T Thumb-1.
 //!
-//! Covered: shifts; MOV/CMP/ADD/SUB immediates; the ALU group; high-register operations and BX;
-//! LDR/STR (immediate, register, SP-relative, PC literal), LDRH/STRH, PUSH/POP, LDM/STM,
+//! Covered: shifts; MOV/CMP/ADD/SUB immediates; the ALU group; high-register operations and
+//! BX/BLX; LDR/STR (immediate, register, SP-relative, PC literal), LDRH/STRH, PUSH/POP, LDM/STM,
 //! the two-halfword `BL`/`BLX` sequences, BKPT, conditional and unconditional branches, and SWI.
 //!
-//! Not covered: sign-extend and byte-reverse (ARMv6), CBZ and the like; hitting one returns `Unsupported`.
+//! Not covered: byte-reverse (ARMv6), CBZ and the like; hitting one returns `Unsupported`.
 
 use crate::common::bits as bitops;
 use crate::common::bits::{ShiftType, sign_extend};
@@ -32,7 +32,7 @@ pub fn decode_into(
     if hi10 == 0b010000 {
         alu_group(raw, ops)?;
     } else if hi10 == 0b010001 {
-        hi_reg_group(raw, ops)?;
+        hi_reg_group(raw, pc, ops)?;
     } else if f(15, 11) == 0b01001 {
         // LDR Rd, [PC, #imm8*4]
         let rd = f(10, 8) as u8;
@@ -280,37 +280,84 @@ fn alu_group(raw: u32, ops: &mut Vec<IrOp>) -> Result<(), DecodeError> {
     Ok(())
 }
 
-fn hi_reg_group(raw: u32, ops: &mut Vec<IrOp>) -> Result<(), DecodeError> {
+fn hi_reg_group(raw: u32, pc: u32, ops: &mut Vec<IrOp>) -> Result<(), DecodeError> {
     // The high-register group: op(2) H1 H2 Rs(3) Rd(3), with Rs's high bit in bit6
     let op = bitops::bits(raw, 9, 8);
     let rs = bitops::bits(raw, 6, 3) as u8;
     let rd = (bitops::bits(raw, 2, 0) | (bitops::bit(raw, 7) << 3)) as u8;
 
+    // A PC source is folded into an immediate at translation time, for the same reason the A32
+    // decoder folds it: r15 does not advance inside a block.
+    //
+    // The value is `instr + 4` **without** clearing bit 1. That is not the alignment `LDR Rd,[pc,#…]`
+    // and `ADD Rd,PC,#imm` use — those both word-align their PC base and have their own arms — and
+    // it is not academic: code that folds a PC-relative literal into a pointer just below the
+    // module base needs the unaligned value to wrap to `module_base - 4`. Reading r15 raw instead
+    // yields an address four bytes higher and faults on the following access.
+    let rs_value = if rs == 15 {
+        Value::Imm(pc.wrapping_add(4))
+    } else {
+        Value::Reg(rs)
+    };
+
     match op {
         0 => ops.push(IrOp::Alu {
             op: AluOp::Add,
             dst: Some(rd),
-            a: Value::Reg(rd),
-            b: Some(Value::Reg(rs)),
+            // The destination is an operand of `add rd, rs`, so `add pc, rs` has to read the same
+            // biased PC the source does rather than whatever r15 happens to hold in a block.
+            a: if rd == 15 {
+                Value::Imm(pc.wrapping_add(4))
+            } else {
+                Value::Reg(rd)
+            },
+            b: Some(rs_value),
             set_flags: false,
         }),
         1 => ops.push(IrOp::Alu {
             op: AluOp::Cmp,
             dst: None,
             a: Value::Reg(rd),
-            b: Some(Value::Reg(rs)),
+            b: Some(rs_value),
             set_flags: true,
         }),
         2 => ops.push(IrOp::Alu {
             op: AluOp::Mov,
             dst: Some(rd),
-            a: Value::Reg(rs),
+            a: rs_value,
             b: None,
             set_flags: false,
         }),
-        _ => ops.push(IrOp::JumpExchange {
-            target: Value::Reg(rs),
-        }),
+        _ => {
+            // BX / BLX (register): bit 7 selects which. BLX also writes LR with the return
+            // address — the next halfword, its Thumb bit set — exactly as the A32 decoder does
+            // for `blx rm`. Leaving it out made the callee return to the *caller's* return
+            // address: its own frame was never popped, and a later frame popped zero into PC.
+            if bitops::bit(raw, 7) == 1 {
+                ops.push(IrOp::Alu {
+                    op: AluOp::Mov,
+                    dst: Some(14),
+                    a: Value::Imm(pc.wrapping_add(2) | 1),
+                    b: None,
+                    set_flags: false,
+                });
+            }
+            ops.push(IrOp::JumpExchange { target: rs_value });
+        }
+    }
+
+    // `add pc, rs` and `mov pc, rs` are branches, not arithmetic with a register for a destination:
+    // the write *is* the jump. Leaving it as a plain write to r15 left the block's control flow
+    // alone, so the driver fell through to the next instruction -- on `w52ca_brain-challenge` that
+    // turned every `add pc, r3` jump-table dispatch into "run the instruction after the table",
+    // which skipped a whole initialisation path and faulted 600 000 instructions later at address 0.
+    //
+    // `Jump`, not `JumpExchange`: in Thumb these two do not switch instruction sets (that is BX/BLX,
+    // op 3 above), so bit 0 of the target is not a state selector here.
+    if matches!(op, 0 | 2) && rd == 15 {
+        ops.push(IrOp::Jump {
+            target: Value::Reg(15),
+        });
     }
     Ok(())
 }
@@ -478,7 +525,14 @@ fn add_pc_sp(raw: u32, pc: u32, ops: &mut Vec<IrOp>) {
 
 fn misc(raw: u32, ops: &mut Vec<IrOp>) -> Result<(), DecodeError> {
     match bitops::bits(raw, 11, 8) {
-        0b0000 | 0b0001 => {
+        // `1011 0000 0 imm7` / `1011 0000 1 imm7`: ADD/SUB SP.
+        //
+        // Only `0b0000`. `1011 0001` is `CBZ`/`CBNZ` (`1011 0z01 iiiii nnn`), which used to be
+        // answered here as well — so a `CBZ` moved the stack pointer by whatever `bits[6:0]` happened
+        // to say instead of branching. Silent, plausible, and exactly the shape this decoder exists to
+        // refuse; it fell out of the coverage histogram asking "which top bytes are unimplemented",
+        // where `0xB1xx` was conspicuously absent.
+        0b0000 => {
             let offset = bitops::bits(raw, 6, 0) * 4;
             let sub = bitops::bit(raw, 7) == 1;
             ops.push(IrOp::Alu {
@@ -525,6 +579,22 @@ fn misc(raw: u32, ops: &mut Vec<IrOp>) -> Result<(), DecodeError> {
             }
             Ok(())
         }
+        // SXTH / SXTB / UXTH / UXTB (ARMv6): `1011 0010 ss ww`, where bits 7-6 pick the pair and
+        // the width. A pack built for an ARMv6 handset executes these on its start-up path, and
+        // the ARM decoder already expresses the same four with two shifts — shared here so the
+        // two instruction sets cannot drift into different answers.
+        0b0010 => {
+            let rm = bitops::bits(raw, 5, 3) as u8;
+            let rd = bitops::bits(raw, 2, 0) as u8;
+            let (signed, bits) = match bitops::bits(raw, 7, 6) {
+                0 => (true, 16),
+                1 => (true, 8),
+                2 => (false, 16),
+                _ => (false, 8),
+            };
+            super::a32::sign_or_zero_extend(rd, rm, signed, bits, ops);
+            Ok(())
+        }
         // BKPT: 1011 1110 imm8
         0b1110 => {
             ops.push(IrOp::Breakpoint {
@@ -534,7 +604,7 @@ fn misc(raw: u32, ops: &mut Vec<IrOp>) -> Result<(), DecodeError> {
         }
         _ => Err(DecodeError::Unsupported {
             encoding: raw,
-            reason: "Thumb misc: sign-extend / REV / CBZ",
+            reason: "Thumb misc: REV / CBZ / BKPT",
         }),
     }
 }

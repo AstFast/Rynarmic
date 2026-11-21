@@ -262,3 +262,57 @@ fn a32_register_offset_shift_is_applied() {
     // 16 >> 2 == 4; using LSL by mistake would read DATA + 64
     assert_eq!(cpu.state.reg(0), 0xBBBB_0002);
 }
+
+/// `sxth` / `sxtb` / `uxth` / `uxtb` — ARMv6's sign/zero extend, which a shipped pack executes on
+/// its module-init path (`sh003_gachinko`, `so004_gachinko`). The encoding lives in the load/store
+/// group's bits[27:25] but in none of its fields, so reading it as a transfer both refused the pack
+/// under this decoder and silently ignored it under the host's interpreter.
+///
+/// One word per case, each `mov`-ing the input in and checking the extended result.
+#[test]
+fn armv6_extend_instructions_widen_correctly() {
+    // mvn r0, #0 gives 0xFFFF_FFFF; `lsr r0, #0` style tricks are unnecessary here because the
+    // inputs are small enough to load with `mov` and then shifted into place by the instruction
+    // under test.
+    let cases: &[(u32, u32, u32, &str)] = &[
+        // (instruction, input, expected, what)
+        (
+            0xE6BF_1070,
+            0x0000_8001,
+            0xFFFF_8001,
+            "sxth 0x8001 -> 0xFFFF8001",
+        ),
+        (
+            0xE6BF_1070,
+            0x0000_7FFF,
+            0x0000_7FFF,
+            "sxth 0x7FFF stays positive",
+        ),
+        (0xE6AF_1070, 0x0000_0080, 0xFFFF_FF80, "sxtb 0x80 -> -128"),
+        (0xE6FF_1070, 0x0000_8001, 0x0000_8001, "uxth zero-extends"),
+        (0xE6EF_1070, 0x0000_00FF, 0x0000_00FF, "uxtb zero-extends"),
+    ];
+
+    for &(insn, input, expected, what) in cases {
+        let mut memory = SimpleMemory::new(0x0000, 0x4000);
+        // The input is loaded by `mov r0, #imm8` when it fits and by `ldr r0, [pc, #4]` otherwise;
+        // both are one word wide, so the instruction under test is always at CODE + 4.
+        if input <= 0xFF {
+            memory.write_words(CODE, &[0xE3A0_0000 | input, insn, 0xE12F_FF1E]);
+        } else {
+            memory.write_words(CODE, &[0xE59F_0004, insn, 0xE12F_FF1E, input]);
+        }
+        memory.write_words(SPIN, &[0xEAFF_FFFE]);
+
+        let mut cpu = Cpu::new(memory);
+        cpu.state.set_pc(CODE);
+        cpu.state.set_reg(14, SPIN);
+        run_until_pc(&mut cpu, SPIN, 100);
+        assert_eq!(
+            cpu.state.reg(1),
+            expected,
+            "{what}: r1 = {:#010x}",
+            cpu.state.reg(1)
+        );
+    }
+}

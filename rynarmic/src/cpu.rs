@@ -333,8 +333,8 @@ impl BlockSlot {
 /// `0x14000` or `0x42000` apart would land in exactly the same slot. Under direct mapping they evict
 /// each other every round, and the same blocks are translated and compiled over and over —
 /// measured, 300 ms of virtual time produced 7911 compilations for only 2155 distinct blocks, the
-/// hottest pair (0x10039388 / 0x10025388) recompiling 68 times each, leaving the JIT 2.4 times
-/// slower than the interpreter. 65536 slots cover 128 KiB and, with the high-bit folding below, hot
+/// hottest pair recompiling 68 times each, leaving the JIT 2.4 times slower than the interpreter.
+/// 65536 slots cover 128 KiB and, with the high-bit folding below, hot
 /// block collisions disappear.
 const BLOCK_CACHE_SIZE: usize = 65536;
 /// `log2(BLOCK_CACHE_SIZE)`, used for the folding; change it along with the slot count.
@@ -596,7 +596,8 @@ impl<M: Memory> Cpu<M> {
                 }
             }
             Flow::Branch(target) => {
-                self.state.set_pc(target);
+                self.state
+                    .set_pc(ArmState::branch_target(self.state.thumb(), target));
                 Ok(StepOutcome::Executed)
             }
             Flow::Exchange(target) => {
@@ -1090,18 +1091,57 @@ impl<M: Memory> Cpu<M> {
             }
 
             match &self.blocks[index] {
-                Some(slot) => Ok(Loaded {
-                    entry: slot.entry,
-                    body: slot.body,
-                    frame: slot.frame,
-                    exchange: slot.exchange,
-                }),
+                Some(slot) => {
+                    // `RYNARMIC_TRACE_PC`: hand the one-instruction block to `run_interpreted`
+                    // rather than to its compiled entry, which is the only place a per-instruction
+                    // register line can be printed from. The block is still cached and compiled as
+                    // usual, so nothing outside the window changes.
+                    if crate::trace::covers(pc) {
+                        return Ok(Loaded::INTERPRETED);
+                    }
+                    Ok(Loaded {
+                        entry: slot.entry,
+                        body: slot.body,
+                        frame: slot.frame,
+                        exchange: slot.exchange,
+                    })
+                }
                 None => unreachable!("the cache slot was just filled"),
             }
         }
     }
 
     /// Interprets one block (or a single step).
+    /// The register file at `pc`, for `RYNARMIC_TRACE_PC`: one line per instruction, since the
+    /// window also caps a block at one instruction (`crate::trace::covers`).
+    ///
+    /// Out of line and cold: a run without the window set never reaches it, and the block driver
+    /// is the hot loop this must not disturb.
+    #[cold]
+    #[inline(never)]
+    fn trace_registers(&self, pc: u32) {
+        let r = &self.state.r;
+        eprintln!(
+            "{pc:08x}  r0={:08x} r1={:08x} r2={:08x} r3={:08x} r4={:08x} r5={:08x} r6={:08x}              r7={:08x} r8={:08x} r9={:08x} r10={:08x} r11={:08x} r12={:08x} sp={:08x} lr={:08x}              cpsr={:08x}",
+            r[0],
+            r[1],
+            r[2],
+            r[3],
+            r[4],
+            r[5],
+            r[6],
+            r[7],
+            r[8],
+            r[9],
+            r[10],
+            r[11],
+            r[12],
+            r[13],
+            r[14],
+            self.state.cpsr.bits(),
+        );
+    }
+
     fn run_interpreted(
         &mut self,
         pc: u32,
@@ -1132,6 +1172,12 @@ impl<M: Memory> Cpu<M> {
                 executor.execute(&block.ops)
             }
         };
+        // Printed **after** the instruction, which is the same point the host's own `--trace` prints
+        // at: the two engines are compared line for line, and a trace that stood before execution on
+        // one side and after it on the other reads as a divergence that is only an offset.
+        if crate::trace::covers(pc) {
+            self.trace_registers(pc);
+        }
 
         let slot = self.blocks[index]
             .as_ref()
@@ -1141,7 +1187,9 @@ impl<M: Memory> Cpu<M> {
 
         match flow {
             Flow::Next => self.state.set_pc(next_pc),
-            Flow::Branch(target) => self.state.set_pc(target),
+            Flow::Branch(target) => self
+                .state
+                .set_pc(ArmState::branch_target(self.state.thumb(), target)),
             Flow::Exchange(target) => {
                 self.state.cpsr.set_t(target & 1 != 0);
                 self.state.set_pc(target & !1);

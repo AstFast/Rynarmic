@@ -137,6 +137,20 @@ fn bench_thumb_literal(iterations: u32, cached: bool) -> f64 {
     budget as f64 / start.elapsed().as_secs_f64() / 1_000_000.0
 }
 
+/// Best of several runs, because this measurement is noisy in one direction only.
+///
+/// Repeating the same binary on the machine this was written on moved a row by up to 49% (`Thumb
+/// with PC-relative loads` ranged 1926-2875 MIPS over three runs) — thermal drift on a laptop, not
+/// code. Noise only ever makes a run *slower*, so the minimum is the closest thing to the number the
+/// code owns, and it is the only way a comparison against a stored baseline means anything.
+/// `compiled_bench` already did this; this example did not, which is why its first recorded table and
+/// its next disagreed by more than any code change could explain.
+const ROUNDS: usize = 3;
+
+fn best(mut run: impl FnMut() -> f64) -> f64 {
+    (0..ROUNDS).map(|_| run()).fold(f64::MIN, f64::max)
+}
+
 fn main() {
     let iterations = 5_000_000;
 
@@ -151,12 +165,12 @@ fn main() {
     bench_arm_predicated(100_000, false);
     bench_arm_predicated(100_000, true);
 
-    let arm_step = bench_arm(iterations, false);
-    let thumb_step = bench_thumb(iterations, false);
-    let arm_cached = bench_arm(iterations, true);
-    let thumb_cached = bench_thumb(iterations, true);
+    let arm_step = best(|| bench_arm(iterations, false));
+    let thumb_step = best(|| bench_thumb(iterations, false));
+    let arm_cached = best(|| bench_arm(iterations, true));
+    let thumb_cached = best(|| bench_thumb(iterations, true));
 
-    println!("iterations: {iterations} (two instructions each)\n");
+    println!("iterations: {iterations} (two instructions each), best of {ROUNDS} runs\n");
     println!("A32   interpreted: {arm_step:7.1} MIPS");
     println!(
         "A32   block cache: {arm_cached:7.1} MIPS  ({:.2}x)",
@@ -167,11 +181,11 @@ fn main() {
         "Thumb block cache: {thumb_cached:7.1} MIPS  ({:.2}x)",
         thumb_cached / thumb_step
     );
-    let lit_step = bench_thumb_literal(iterations, false);
-    let lit_cached = bench_thumb_literal(iterations, true);
+    let lit_step = best(|| bench_thumb_literal(iterations, false));
+    let lit_cached = best(|| bench_thumb_literal(iterations, true));
     println!();
-    let pred_step = bench_arm_predicated(iterations, false);
-    let pred_cached = bench_arm_predicated(iterations, true);
+    let pred_step = best(|| bench_arm_predicated(iterations, false));
+    let pred_cached = best(|| bench_arm_predicated(iterations, true));
     println!("A32 with conditional execution (four per round):");
     println!("  interpreted: {pred_step:7.1} MIPS");
     println!(

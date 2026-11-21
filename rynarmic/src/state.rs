@@ -320,4 +320,16 @@ impl ArmState {
     pub fn thumb(&self) -> bool {
         self.cpsr.t()
     }
+
+    /// `BranchWritePC`: clear the low bits of a branch target and leave the instruction set alone.
+    ///
+    /// This is the operation `MOV pc, Rm` performs before ARMv7 — Dynarmic's `ALUWritePC` answers
+    /// `BranchWritePC` for every architecture below v7 and only exchanges in v7 ARM state — and it is
+    /// also what a plain `B` does, where the target is already aligned so the mask changes nothing.
+    /// Kept as a free-standing rule rather than folded into [`ArmState::set_pc`] so that the
+    /// exchange paths (`BX`/`BLX`, and any load writing PC) stay visibly different from this one.
+    #[inline]
+    pub const fn branch_target(thumb: bool, target: u32) -> u32 {
+        if thumb { target & !1 } else { target & !3 }
+    }
 }

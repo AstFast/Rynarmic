@@ -349,12 +349,19 @@ fn conditional_v5te_instruction_is_skipped() {
 }
 
 // ---------------------------------------------------------------------------
-// A load or data operation that writes PC is an interworking branch (ARMv5TE)
+// Writing PC: a *load* interworks, a data operation does not (ARMv5TE)
 //
 // A Thumb function return is `pop {.., pc}`, and the return address's bit 0 is the state bit:
-// writing it into PC has to clear bit 0 and set T from it. All three used to be emitted as a plain
-// `Jump`, stuffing the address with bit 0 straight into PC and then fetching under the wrong state (a host running
-// a real module crashed on an unmapped address because of it).
+// writing it into PC from a load has to clear bit 0 and set T from it. Those used to be emitted as a
+// plain `Jump`, stuffing the address with bit 0 straight into PC and then fetching under the wrong
+// state (a host running a real module crashed on an unmapped address because of it).
+//
+// A **data-processing** write is the opposite and used to be wrong the other way round: `MOV pc, Rm`
+// went out as `JumpExchange`, which is the ARMv7 rule. Dynarmic states the split in
+// `a32_ir_emitter.cpp` — `ALUWritePC` answers `BXWritePC` only for `ArchVersion() >= 7` in ARM state,
+// and `BranchWritePC` for everything else — and this backend is ARMv5TEJ, so `MOV pc, Rm` clears the
+// low bits and leaves the instruction set alone. Both halves are pinned below, because a decoder
+// change for Thumb-2 will touch exactly this neighbourhood.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -385,14 +392,45 @@ fn arm_ldm_with_pc_interworks() {
 }
 
 #[test]
-fn arm_data_processing_write_to_pc_interworks() {
+fn arm_data_processing_write_to_pc_does_not_interwork() {
+    // `mov pc, r1` with an odd value: `BranchWritePC` clears the low bits and leaves T alone, so this
+    // stays in ARM state. It used to switch to Thumb (`JumpExchange`), which is ARMv7's rule.
     let mut memory = SimpleMemory::new(0, 0x4000);
     memory.write_words(CODE, &[0xE1A0_F001]); // mov pc, r1
     let mut cpu = Cpu::new(memory);
     cpu.state.set_pc(CODE);
     cpu.state.set_reg(1, 0x1051);
     cpu.step().unwrap();
+    assert_eq!(cpu.state.pc(), 0x1050, "the low two bits are cleared");
+    assert!(
+        !cpu.state.thumb(),
+        "a data-processing write to PC does not change the instruction set"
+    );
+
+    // Bit 1 as well: ARMv5 calls an unaligned ALU target UNPREDICTABLE, and masking both bits is what
+    // `BranchWritePC` documents rather than something to guess at.
+    let mut memory = SimpleMemory::new(0, 0x4000);
+    memory.write_words(CODE, &[0xE1A0_F001]);
+    let mut cpu = Cpu::new(memory);
+    cpu.state.set_pc(CODE);
+    cpu.state.set_reg(1, 0x1052);
+    cpu.step().unwrap();
     assert_eq!(cpu.state.pc(), 0x1050);
+    assert!(!cpu.state.thumb());
+}
+
+#[test]
+fn thumb_data_processing_write_to_pc_clears_only_bit_0() {
+    // The same rule in Thumb state, where only bit 0 is masked: `mov pc, r1` with 0x1053 lands on
+    // 0x1052 and stays Thumb. Dynarmic's `BranchWritePC` masks `0xFFFFFFFE` when the T flag is set.
+    let mut memory = SimpleMemory::new(0, 0x4000);
+    memory.write_thumb(CODE, &[0x468F]); // mov pc, r1
+    let mut cpu = Cpu::new(memory);
+    cpu.state.set_pc(CODE);
+    cpu.state.cpsr = Cpsr::from_bits(0x13 | 0x20);
+    cpu.state.set_reg(1, 0x1053);
+    cpu.step().unwrap();
+    assert_eq!(cpu.state.pc(), 0x1052);
     assert!(cpu.state.thumb());
 }
 
@@ -421,4 +459,33 @@ fn thumb_pop_pc_interworks() {
     cpu.step().unwrap();
     assert_eq!(cpu.state.pc(), 0x1050);
     assert!(!cpu.state.thumb());
+}
+
+/// The same rule through the compiled path, which has its own masking for a dynamic jump target.
+///
+/// The interpreter and the JIT have to agree here or a run stops being replayable; the mask lives in
+/// two different places (`ArmState::branch_target` and `backend/x64.rs`'s `IrOp::Jump`), so this test
+/// exists to notice when only one of them is touched.
+#[test]
+fn arm_data_processing_write_to_pc_does_not_interwork_under_the_jit() {
+    let run = |jit: bool| {
+        let mut memory = SimpleMemory::new(0, 0x4000);
+        memory.write_words(CODE, &[0xE1A0_F001, 0xEAFF_FFFE]); // mov pc, r1 ; b .
+        let mut cpu = Cpu::new(memory);
+        cpu.state.set_pc(CODE);
+        cpu.state.set_reg(1, 0x1051);
+        cpu.set_jit_enabled(jit);
+        if jit {
+            cpu.run_cached(1).unwrap();
+            assert!(
+                cpu.compiled_block_count() >= 1,
+                "the block has to be compiled for this to test the JIT"
+            );
+        } else {
+            cpu.run(1).unwrap();
+        }
+        (cpu.state.pc(), cpu.state.thumb())
+    };
+    assert_eq!(run(false), (0x1050, false), "interpreted");
+    assert_eq!(run(true), (0x1050, false), "compiled, and it must agree");
 }

@@ -3,8 +3,11 @@
 //! Target ISA: **ARMv5TEJ**, the ARM926EJ-S level.
 //! Covered: the integer core; v5's CLZ, BKPT and BLX; v5TE's halfword and signed accesses, 64-bit multiplies,
 //! halfword multiplies, saturating arithmetic, and LDRD/STRD.
+//! Also covered, because shipped packs execute them: the ARMv6 sign/zero extends `SXTB`/`SXTH`/
+//! `UXTB`/`UXTH`. They are the one v6 corner the corpus actually reaches, and refusing them ended
+//! two packs after 24 instructions.
 //! Not covered: VFP/NEON, Jazelle bytecode execution (`BXJ` is treated as `BX`, matching the hardware's fallback behaviour),
-//! and the v6 and later media and exclusive-access instructions.
+//! and the rest of the v6 and later media and exclusive-access instructions.
 
 use crate::common::bits as bitops;
 use crate::common::bits::{ShiftType, shift_c, sign_extend};
@@ -41,13 +44,21 @@ pub fn decode_into(
         0b000 | 0b001 => misc_and_data_processing(inst, pc, ops)?,
         0b010 => load_store(inst, pc, ops, false)?,
         0b011 => {
-            if bitops::bit(inst, 4) == 1 {
+            // ARMv6's `SXTB`/`SXTH`/`UXTB`/`UXTH` sit in this group's bits[27:25] but in none of
+            // its fields: bits[19:16] are fixed `1111` and bits[11:4] fixed `0x07`, which is what
+            // tells them apart from a transfer before `load_store` reads the word as one. A shipped
+            // pack executes `sxth` on its own module-init path (`sh003_gachinko`, `so004_gachinko`),
+            // and refusing the encoding ended those runs after 24 instructions.
+            if let Some((rd, rm, signed, bits)) = extend_operands(inst) {
+                sign_or_zero_extend(rd, rm, signed, bits, ops);
+            } else if bitops::bit(inst, 4) == 1 {
                 return Err(DecodeError::Unsupported {
                     encoding: inst,
                     reason: "media instructions (ARMv6)",
                 });
+            } else {
+                load_store(inst, pc, ops, true)?;
             }
-            load_store(inst, pc, ops, true)?;
         }
         0b100 => block_transfer(inst, ops)?,
         0b101 => branch(inst, pc, ops),
@@ -607,12 +618,85 @@ fn data_processing(inst: u32, pc: u32, ops: &mut Vec<IrOp>) -> Result<(), Decode
                 reason: "exception return (data-processing write to PC with S=1)",
             });
         }
-        ops.push(IrOp::JumpExchange {
+        // `ALUWritePC`, and for this architecture it is `BranchWritePC`: the low bits are cleared and
+        // the instruction set does **not** change.
+        //
+        // It used to be `JumpExchange`, which is the ARMv7 answer — Dynarmic spells the split out in
+        // `a32_ir_emitter.cpp`: `if (ArchVersion() >= 7 && !current_location.TFlag()) BXWritePC else
+        // BranchWritePC`. This backend is ARMv5TEJ, so it is the else. The difference is visible: an
+        // odd target in ARM state used to switch to Thumb, which the hardware does not do — a Thumb
+        // return address reaches PC through `BX`/`POP`, never through `MOV pc, lr`.
+        //
+        // The masking that `BranchWritePC` owes is applied where every branch's target is applied
+        // (`Cpu` masks by state when it consumes `Flow::Branch`), so `Jump` is the right operation
+        // here rather than a variant of it.
+        ops.push(IrOp::Jump {
             target: Value::Reg(15),
         });
     }
 
     Ok(())
+}
+
+/// `SXTB`/`SXTH`/`UXTB`/`UXTH` (ARMv6): `cond 0110 101x 1111 Rd 0000 0111 Rm` and its three
+/// siblings, returned as `(Rd, Rm, signed, source bits)`.
+///
+/// The four share bits[27:24]; bits[23:20] are what tell them apart — `1010`/`1011` sign-extend a
+/// byte/halfword and `1110`/`1111` zero-extend one. Read against two fixed fields rather than a
+/// table so a mediaspace word can never be mistaken for one of these.
+fn extend_operands(inst: u32) -> Option<(u8, u8, bool, u8)> {
+    if bitops::bits(inst, 19, 16) != 0xF || bitops::bits(inst, 11, 4) != 0x07 {
+        return None;
+    }
+    let (signed, bits) = match bitops::bits(inst, 27, 20) {
+        0x6A => (true, 8),
+        0x6B => (true, 16),
+        0x6E => (false, 8),
+        0x6F => (false, 16),
+        _ => return None,
+    };
+    Some((
+        bitops::bits(inst, 15, 12) as u8,
+        (inst & 0xF) as u8,
+        signed,
+        bits,
+    ))
+}
+
+/// Emits a sign or zero extension as two shifts: the value is moved to the top of the word and
+/// shifted back arithmetically (sign) or logically (zero).
+///
+/// Two existing operations rather than a new `IrOp`, because a new op has to be taught to the
+/// optimizer, the interpreter *and* the x64 emitter, and every one of those is a place where a
+/// half-taught op silently changes meaning.
+pub(super) fn sign_or_zero_extend(rd: u8, rm: u8, signed: bool, bits: u8, ops: &mut Vec<IrOp>) {
+    let up = 32 - bits;
+    ops.push(IrOp::Alu {
+        op: AluOp::Mov,
+        dst: Some(rd),
+        a: Value::Shifted {
+            reg: rm,
+            shift: ShiftType::Lsl,
+            by: Shifter::Imm(up),
+        },
+        b: None,
+        set_flags: false,
+    });
+    ops.push(IrOp::Alu {
+        op: AluOp::Mov,
+        dst: Some(rd),
+        a: Value::Shifted {
+            reg: rd,
+            shift: if signed {
+                ShiftType::Asr
+            } else {
+                ShiftType::Lsr
+            },
+            by: Shifter::Imm(up),
+        },
+        b: None,
+        set_flags: false,
+    });
 }
 
 fn load_store(

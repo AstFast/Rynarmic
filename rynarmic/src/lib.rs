@@ -17,6 +17,7 @@ pub mod executor;
 pub mod ir;
 pub mod memory;
 pub mod state;
+pub mod trace;
 
 pub use block::BasicBlock;
 pub use cpu::{Cpu, ExceptionKind, StepOutcome};

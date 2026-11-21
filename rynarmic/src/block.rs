@@ -102,7 +102,15 @@ pub fn translate<M: Memory>(
     // The address of the last instruction **taken into this block**; on an exception PC stops here
     let mut terminal_pc = start_pc;
 
-    while count < MAX_INSTRUCTIONS_PER_BLOCK {
+    // A trace window asks for one instruction per block: then `Cpu::step` stands at the start of
+    // each instruction inside the window and can print the registers there. See `crate::trace`.
+    let cap = if crate::trace::covers(start_pc) {
+        1
+    } else {
+        MAX_INSTRUCTIONS_PER_BLOCK
+    };
+
+    while count < cap {
         let instruction_pc = pc;
         let result = if is_thumb {
             translate_thumb_instruction(memory, instruction_pc, &mut ops)
@@ -136,6 +144,12 @@ pub fn translate<M: Memory>(
         terminal_pc = instruction_pc;
         count += 1;
         pc = instruction_pc.wrapping_add(length);
+
+        // A block that began outside the window must not swallow the window's first instruction:
+        // that instruction needs a block of its own, or it is never traced at.
+        if crate::trace::covers(pc) {
+            break;
+        }
 
         if matches!(action, Action::EndBlock) {
             break;

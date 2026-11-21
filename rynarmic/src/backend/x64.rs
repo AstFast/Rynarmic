@@ -1143,7 +1143,17 @@ fn emit_cmov_region(
     for (op, dst, a, b) in writes {
         // The feedback form (dst is the first operand) prefers mask committing: one cmov fewer, one fewer copy of
         // the old value, and it replaces a cmov on the critical path with an ordinary ALU.
-        if let Some(operand) = maskable_write(*op, *dst, *a, *b) {
+        //
+        // It feeds the condition in T3, so it is only usable while T3 still holds the mask. A `Captured`
+        // that came through a branch guard has no T3 copy — the skipped path may clobber it — and the
+        // memory byte is 0/1 (or the low byte of the mask), not a mask; that case takes the cmov route
+        // below, which reads `cond_cache` instead.
+        let maskable = if in_t3 {
+            maskable_write(*op, *dst, *a, *b)
+        } else {
+            None
+        };
+        if let Some(operand) = maskable {
             // T1 = b & mask (with b = 0 the result is unchanged, which is precisely "the condition fails")
             emit_value(ops, operand, T1, false);
             dynasm!(ops ; and Rd(T1), Rd(T3));
@@ -1613,7 +1623,18 @@ fn emit_ops(
                     Value::Imm(pc) => {
                         emit_link_site(ops, epilogue, pc, thumb, block.start_pc, body, slots)
                     }
-                    _ => dynasm!(ops ; jmp => epilogue),
+                    // A dynamic target is `BranchWritePC` (`MOV pc, Rm` before ARMv7), so the low bits
+                    // go before it becomes PC — the interpreter does the same in
+                    // `ArmState::branch_target`, and the two have to agree or a run differs from a
+                    // replayed one. A static target comes from a branch encoding and is aligned
+                    // already, which is why the linked path above needs no mask and pays nothing.
+                    _ => {
+                        if thumb {
+                            dynasm!(ops ; and Rd(RESULT), !1 ; jmp => epilogue);
+                        } else {
+                            dynasm!(ops ; and Rd(RESULT), !3 ; jmp => epilogue);
+                        }
+                    }
                 }
             }
             IrOp::JumpExchange { target } => {

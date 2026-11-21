@@ -1151,3 +1151,212 @@ fn thumb_cross_block_lazy_flags_match_interpreter() {
 
     assert_eq!(digest(&reference), digest(&jitted));
 }
+
+/// `POP {…, pc}` must put SP back exactly where `PUSH` left it. A Thumb block that returns
+/// through PC ends with a dynamic jump, and the writeback that goes with the load is the part a
+/// register-list transfer can silently lose: the caller then runs on a stack sixteen bytes low,
+/// which is what a real pack showed as a return address of zero two frames later.
+#[test]
+fn thumb_push_pop_with_pc_restores_sp_under_jit() {
+    // push {r4, r5, r6, lr} ; movs r0, #9 ; pop {r4, r5, r6, pc}
+    let program = [0xB570u16, 0x2009, 0xBD70];
+    let spin = 0x1200u32;
+    let setup = |cpu: &mut Cpu<SimpleMemory>| {
+        cpu.memory.write_thumb(spin, &[0xE7FE]);
+        cpu.state.set_reg(13, 0x3000);
+        cpu.state.set_reg(14, spin | 1);
+        cpu.state.set_reg(4, 0x4444_4444);
+        cpu.state.set_reg(5, 0x5555_5555);
+        cpu.state.set_reg(6, 0x6666_6666);
+    };
+
+    let mut reference = thumb_cpu(&program);
+    setup(&mut reference);
+    reference.run(3).unwrap();
+
+    let mut jitted = thumb_cpu(&program);
+    setup(&mut jitted);
+    jitted.run_cached(3).unwrap();
+    assert!(
+        jitted.compiled_block_count() > 0,
+        "the block should be JIT compiled"
+    );
+    assert_eq!(digest(&reference), digest(&jitted));
+}
+
+/// `BLX Rm` is a call, not a plain branch: it writes LR, and a callee that returns through
+/// `pop {…, pc}` depends on that. A decoder that treats it as `BX` sends the return two frames
+/// up and leaves the callee's pushed frame behind — the shape a real pack showed as a zero PC.
+#[test]
+fn thumb_blx_register_links_under_jit() {
+    let program = [
+        0x2005u16, // 1000: movs r0, #5
+        0x4788,    // 1002: blx r1
+        0x4602,    // 1004: mov r2, r0
+        0xE7FE,    // 1006: b .
+    ];
+    let setup = |cpu: &mut Cpu<SimpleMemory>| {
+        cpu.memory.write_thumb(
+            0x1100,
+            &[
+                0xB530, // push {r4, r5, lr}
+                0x2401, // movs r4, #1
+                0x1900, // adds r0, r0, r4
+                0xBD30, // pop {r4, r5, pc}
+            ],
+        );
+        cpu.memory.write_thumb(0x1200, &[0xE7FE]);
+        cpu.state.set_reg(1, 0x1101);
+        cpu.state.set_reg(13, 0x3000);
+        cpu.state.set_reg(14, 0x1201);
+    };
+
+    let mut reference = thumb_cpu(&program);
+    setup(&mut reference);
+    reference.run(8).unwrap();
+
+    let mut jitted = thumb_cpu(&program);
+    setup(&mut jitted);
+    jitted.run_cached(8).unwrap();
+    assert!(
+        jitted.compiled_block_count() > 0,
+        "the block should be JIT compiled"
+    );
+    assert_eq!(digest(&reference), digest(&jitted));
+}
+
+/// The ARMv6 Thumb extends are expressed as two ordinary shifts, so the JIT has to agree with the
+/// interpreter for all four — a pack built for a v6 handset executes them on its start-up path.
+#[test]
+fn thumb_armv6_extends_match_jit() {
+    for (insn, input) in [
+        (0xB288u16, 0x0000_8001u32), // uxth r0, r1
+        (0xB2C8, 0x0000_00ff),       // uxtb r0, r1
+        (0xB208, 0x0000_8001),       // sxth r0, r1
+        (0xB248, 0x0000_0080),       // sxtb r0, r1
+    ] {
+        let program = [insn, 0xE7FE];
+        let mut reference = thumb_cpu(&program);
+        let mut jitted = thumb_cpu(&program);
+        for cpu in [&mut reference, &mut jitted] {
+            cpu.state.set_reg(1, input);
+        }
+        reference.run(1).unwrap();
+        jitted.run_cached(1).unwrap();
+        assert!(
+            jitted.compiled_block_count() > 0,
+            "{insn:#06X} should be JIT compiled"
+        );
+        assert_eq!(digest(&reference), digest(&jitted), "{insn:#06X}");
+    }
+}
+
+/// A conditional instruction after `subs` reads the flags that instruction produced. The app's dialog
+/// scanner is exactly this shape (`sub ip, r2, #0xff00` / `subs ip, ip, #0xff` / `addne` / `strne`),
+/// and a JIT that loses Z there would count zero objects and skip every drawing that follows.
+#[test]
+fn conditional_execution_after_subs_matches_jit() {
+    let program = [
+        0xE242CCFF,  // sub  ip, r2, #0xff00
+        0xE25CC0FF,  // subs ip, ip, #0xff
+        0x12877001,  // addne r7, r7, #1
+        0xE1A08007,  // mov  r8, r7
+        0xEAFF_FFFE, // b .
+    ];
+    let run = |jit: bool| {
+        let mut cpu = new_cpu(&program);
+        cpu.state.set_reg(2, 0x6003);
+        cpu.state.set_reg(7, 0);
+        cpu.set_jit_enabled(jit);
+        if jit {
+            cpu.run_cached(5).unwrap();
+            assert!(
+                cpu.compiled_block_count() > 0,
+                "the block should be JIT compiled"
+            );
+        } else {
+            cpu.run(5).unwrap();
+        }
+        (cpu.state.r, cpu.state.cpsr.bits())
+    };
+    assert_eq!(run(false), run(true), "condition after subs must agree");
+}
+
+/// The shape the dialog scanner actually runs: a conditional store followed by another conditional
+/// instruction reading the *same* Z. A memory access is the instruction most likely to destroy the
+/// host's flag register, so the second guard must still see the flags `subs` produced.
+#[test]
+fn conditional_store_then_conditional_add_matches_jit() {
+    let program = [
+        0xE242CCFF,  // sub   ip, r2, #0xff00
+        0xE25CC0FF,  // subs  ip, ip, #0xff
+        0x11A02007,  // movne r2, r7
+        0x12883020,  // addne r3, r8, #0x20
+        0x17830102,  // strne r0, [r3, r2, lsl #2]
+        0x12877001,  // addne r7, r7, #1
+        0xE1A09007,  // mov   sb, r7
+        0xEAFF_FFFE, // b .
+    ];
+    let run = |jit: bool| {
+        let mut cpu = new_cpu(&program);
+        cpu.state.set_reg(2, 0x6003);
+        cpu.state.set_reg(7, 0);
+        cpu.state.set_reg(0, 0x1234);
+        cpu.state.set_reg(8, DATA);
+        cpu.set_jit_enabled(jit);
+        if jit {
+            cpu.run_cached(7).unwrap();
+            assert!(
+                cpu.compiled_block_count() > 0,
+                "the block should be JIT compiled"
+            );
+        } else {
+            cpu.run(7).unwrap();
+        }
+        digest(&cpu)
+    };
+    assert_eq!(
+        run(false),
+        run(true),
+        "condition after a conditional store must agree"
+    );
+}
+
+/// A guard is evaluated where it stands. A later flag write in the same block (`cmp` here) must not
+/// retroactively decide an earlier `movne`: the dialog scanner has exactly this shape, and a guard
+/// answered with the final flags counts no objects at all.
+#[test]
+fn a_guard_before_a_later_cmp_uses_the_earlier_flags() {
+    let program = [
+        0xE244CCFF,  // sub   ip, r4, #0xff00
+        0xE25CC0FF,  // subs  ip, ip, #0xff   -> Z = 0
+        0x13A03001,  // movne r3, #1
+        0xE1520001,  // cmp   r2, r1          -> Z = 1
+        0xBAFFFFFC,  // blt   back            (not taken: equal)
+        0xE1A09003,  // mov   sb, r3
+        0xEAFF_FFFE, // b .
+    ];
+    let run = |jit: bool| {
+        let mut cpu = new_cpu(&program);
+        cpu.state.set_reg(4, 0x6003);
+        cpu.state.set_reg(1, 5);
+        cpu.state.set_reg(2, 5);
+        cpu.state.set_reg(3, 0);
+        cpu.set_jit_enabled(jit);
+        if jit {
+            cpu.run_cached(6).unwrap();
+            assert!(
+                cpu.compiled_block_count() > 0,
+                "the block should be JIT compiled"
+            );
+        } else {
+            cpu.run(6).unwrap();
+        }
+        digest(&cpu)
+    };
+    assert_eq!(
+        run(false),
+        run(true),
+        "an earlier guard must not read the later cmp's flags"
+    );
+}
